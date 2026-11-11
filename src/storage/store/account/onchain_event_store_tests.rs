@@ -298,6 +298,88 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_slot_is_active_at() {
+        let invalidate_at = 1_800_000_000;
+        let slot = StorageSlot::new(1, 0, 0, invalidate_at);
+        let at = |unix_seconds: u32| FarcasterTime::from_unix_seconds(unix_seconds as u64);
+
+        assert_eq!(slot.is_active_at(&at(invalidate_at - 1)), true);
+        assert_eq!(slot.is_active_at(&at(invalidate_at)), false);
+        assert_eq!(slot.is_active_at(&at(invalidate_at + 1)), false);
+    }
+
+    #[test]
+    fn test_storage_slot_merge_at() {
+        let expires_first = StorageSlot::new(1, 2, 0, 1_700_000_000);
+        let expires_later = StorageSlot::new(2, 1, 0, 1_800_000_000);
+        let before_both = FarcasterTime::from_unix_seconds(1_650_000_000);
+        let between = FarcasterTime::from_unix_seconds(1_750_000_000);
+        let after_both = FarcasterTime::from_unix_seconds(1_850_000_000);
+
+        let mut slot = expires_later.clone();
+        assert_eq!(slot.merge_at(&expires_first, &before_both), true);
+        assert_eq!(slot.units_for(StorageUnitType::UnitTypeLegacy), 3);
+        assert_eq!(slot.units_for(StorageUnitType::UnitType2024), 3);
+        assert_eq!(slot.invalidate_at, 1_700_000_000);
+
+        let mut slot = expires_later.clone();
+        assert_eq!(slot.merge_at(&expires_first, &between), false);
+        assert_eq!(slot.units_for(StorageUnitType::UnitTypeLegacy), 2);
+        assert_eq!(slot.units_for(StorageUnitType::UnitType2024), 1);
+        assert_eq!(slot.invalidate_at, 1_800_000_000);
+
+        let mut slot = expires_first.clone();
+        assert_eq!(slot.merge_at(&expires_later, &between), true);
+        assert_eq!(slot.units_for(StorageUnitType::UnitTypeLegacy), 2);
+        assert_eq!(slot.units_for(StorageUnitType::UnitType2024), 1);
+        assert_eq!(slot.invalidate_at, 1_800_000_000);
+
+        let mut slot = expires_first.clone();
+        assert_eq!(slot.merge_at(&expires_later, &after_both), false);
+        assert_eq!(slot.units_for(StorageUnitType::UnitTypeLegacy), 1);
+        assert_eq!(slot.units_for(StorageUnitType::UnitType2024), 2);
+    }
+
+    #[test]
+    fn test_storage_slot_for_fid_is_judged_at_given_timestamp() {
+        let (store, _dir) = store();
+
+        let rent_event = factory::events_factory::create_rent_event(
+            10,
+            3,
+            StorageUnitType::UnitTypeLegacy,
+            false,
+            FarcasterNetwork::Mainnet,
+        );
+        let invalidate_at =
+            StorageSlot::from_event(&rent_event, FarcasterNetwork::Mainnet, EngineVersion::V17)
+                .unwrap()
+                .invalidate_at as u64;
+
+        let mut txn = RocksDbTransactionBatch::new();
+        store.merge_onchain_event(rent_event, &mut txn).unwrap();
+        store.db.commit(txn).unwrap();
+
+        let units_at = |unix_seconds: u64| {
+            store
+                .get_storage_slot_for_fid(
+                    10,
+                    FarcasterNetwork::Mainnet,
+                    EngineVersion::V17,
+                    &[],
+                    &StorageSlot::new(0, 0, 0, 0),
+                    &StorageSlot::new(0, 0, 0, 0),
+                    &FarcasterTime::from_unix_seconds(unix_seconds),
+                )
+                .unwrap()
+                .units_for(StorageUnitType::UnitTypeLegacy)
+        };
+
+        assert_eq!(units_at(invalidate_at - 1), 3);
+        assert_eq!(units_at(invalidate_at), 0);
+    }
+
+    #[test]
     fn test_storage_slot_when_no_units() {
         let (store, _dir) = store();
 
@@ -309,6 +391,7 @@ mod tests {
                 &[],
                 &StorageSlot::new(0, 0, 0, 0),
                 &StorageSlot::new(0, 0, 0, 0),
+                &FarcasterTime::current(),
             )
             .unwrap();
         assert_eq!(storage_slot.is_active(), false);
@@ -409,6 +492,7 @@ mod tests {
                 &[],
                 &StorageSlot::new(0, 0, 0, 0),
                 &StorageSlot::new(0, 0, 0, 0),
+                &FarcasterTime::current(),
             )
             .unwrap();
         assert_eq!(storage_slot_different_fid.is_active(), true);
@@ -433,6 +517,7 @@ mod tests {
                 &[],
                 &StorageSlot::new(0, 0, 0, 0),
                 &StorageSlot::new(0, 0, 0, 0),
+                &FarcasterTime::current(),
             )
             .unwrap();
         assert_eq!(storage_slot.is_active(), true);
@@ -447,6 +532,7 @@ mod tests {
                 &[],
                 &StorageSlot::new(0, 0, 0, 0),
                 &StorageSlot::new(0, 0, 0, 0),
+                &FarcasterTime::current(),
             )
             .unwrap();
         assert_eq!(storage_slot_2025.is_active(), true);

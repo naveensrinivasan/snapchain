@@ -329,6 +329,7 @@ pub fn assert_storage_balance(
                 &vec![],
                 true,
                 true,
+                &crate::core::util::FarcasterTime::current(),
             )
             .unwrap()
             .units_for(unit_type),

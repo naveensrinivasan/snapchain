@@ -462,6 +462,7 @@ impl BlockStores {
         pending_onchain_events: &Vec<OnChainEvent>,
         count_lent_storage: bool,
         count_borrowed_storage: bool,
+        timestamp: &FarcasterTime,
     ) -> Option<StorageSlot> {
         let lent_storage = if count_lent_storage {
             StorageLendStore::get_lent_storage(&self.storage_lend_store, fid).ok()?
@@ -483,6 +484,7 @@ impl BlockStores {
                 pending_onchain_events.as_slice(),
                 &lent_storage,
                 &borrowed_storage,
+                timestamp,
             )
             .ok()
     }
@@ -1042,7 +1044,14 @@ impl BlockEngine {
             crate::proto::message_data::Body::LendStorageBody(lend_storage) => {
                 let total_storage_purchased = self
                     .stores
-                    .get_storage_slot_for_fid(message_data.fid, version, &vec![], false, false)
+                    .get_storage_slot_for_fid(
+                        message_data.fid,
+                        version,
+                        &vec![],
+                        false,
+                        false,
+                        timestamp,
+                    )
                     .ok_or(MessageValidationError::InsufficientStorage)?;
 
                 // Restricts who can lend storage to some reasonable set of users. Don't enforce this limit in devnet and testnet so we can test with fewer storage units.
@@ -1396,11 +1405,15 @@ impl BlockEngine {
         &mut self,
         storage_slot: &mut StorageSlot,
         merge_message_body: &MergeMessageBody,
+        timestamp: &FarcasterTime,
     ) -> Result<(), BlockEngineError> {
         if let Some(added_message) = &merge_message_body.message {
             match added_message.data.as_ref().unwrap().body.as_ref().unwrap() {
                 proto::message_data::Body::LendStorageBody(lend_storage_body) => {
-                    storage_slot.sub(&StorageSlot::from_storage_lend(&lend_storage_body));
+                    storage_slot.sub_at(
+                        &StorageSlot::from_storage_lend(&lend_storage_body),
+                        timestamp,
+                    );
                 }
                 _ => {}
             }
@@ -1416,7 +1429,10 @@ impl BlockEngine {
                 .unwrap()
             {
                 proto::message_data::Body::LendStorageBody(lend_storage_body) => {
-                    storage_slot.merge(&StorageSlot::from_storage_lend(&lend_storage_body));
+                    storage_slot.merge_at(
+                        &StorageSlot::from_storage_lend(&lend_storage_body),
+                        timestamp,
+                    );
                 }
                 _ => {}
             }
@@ -1485,7 +1501,7 @@ impl BlockEngine {
         }
 
         let mut storage_slot = self
-            .storage_slot_for_transaction(snapchain_txn, version, true, false)
+            .storage_slot_for_transaction(snapchain_txn, version, true, false, timestamp)
             .unwrap();
         // Lending validation must exclude borrowed units, but verification quota must include
         // them exactly as data-shard StoreLimits does. Keep two views and apply any successful
@@ -1510,7 +1526,7 @@ impl BlockEngine {
             // would turn a transient local read failure into a panic on the propose/validate/
             // commit paths. Surface it as an error instead, matching the data shard, whose
             // equivalent read maps to `EngineError::UsageCountError` rather than aborting.
-            self.storage_slot_for_transaction(snapchain_txn, version, true, true)
+            self.storage_slot_for_transaction(snapchain_txn, version, true, true, timestamp)
                 .ok_or_else(|| {
                     BlockEngineError::HubError(HubError::internal_db_error(
                         "unable to read storage slot for shard-0 verification quota",
@@ -1551,10 +1567,11 @@ impl BlockEngine {
                                     {
                                         // Both views must see the same lend, or verification
                                         // admission and lend validation drift apart.
-                                        self.on_merge_message(&mut storage_slot, body)?;
+                                        self.on_merge_message(&mut storage_slot, body, timestamp)?;
                                         self.on_merge_message(
                                             &mut verification_storage_slot,
                                             body,
+                                            timestamp,
                                         )?;
                                     }
                                 }
@@ -1888,6 +1905,7 @@ impl BlockEngine {
         engine_version: EngineVersion,
         count_lent_storage: bool,
         count_borrowed_storage: bool,
+        timestamp: &FarcasterTime,
     ) -> Option<StorageSlot> {
         let pending_onchain_events: Vec<OnChainEvent> = snapchain_txn
             .system_messages
@@ -1901,6 +1919,7 @@ impl BlockEngine {
             &pending_onchain_events,
             count_lent_storage,
             count_borrowed_storage,
+            timestamp,
         )
     }
 
@@ -1922,11 +1941,16 @@ impl BlockEngine {
             .into_iter()
             .filter_map(|mut transaction| {
                 // TODO(aditi): We could share this code with the shard engine but there may be other things we want to add here. For example, it may make sense to exclude validator messages and user messages that aren't intended for shard 0 here so a bug in the mempool won't impact the protocol in a significant way.
-                let storage_slot =
-                    self.storage_slot_for_transaction(&transaction, version, true, true)?;
+                let storage_slot = self.storage_slot_for_transaction(
+                    &transaction,
+                    version,
+                    true,
+                    true,
+                    timestamp,
+                )?;
 
                 // Drop events if storage slot is inactive
-                if !storage_slot.is_active() {
+                if !storage_slot.is_active_at(timestamp) {
                     transaction.user_messages = vec![];
                 }
 
@@ -2027,9 +2051,14 @@ impl BlockEngine {
             .unwrap()
             .into_iter()
             .filter_map(|mut transaction| {
-                let storage_slot =
-                    self.storage_slot_for_transaction(&transaction, version, true, true)?;
-                if !storage_slot.is_active() {
+                let storage_slot = self.storage_slot_for_transaction(
+                    &transaction,
+                    version,
+                    true,
+                    true,
+                    &timestamp,
+                )?;
+                if !storage_slot.is_active_at(&timestamp) {
                     transaction.user_messages.clear();
                 }
                 (!transaction.system_messages.is_empty() || !transaction.user_messages.is_empty())

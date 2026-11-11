@@ -4200,7 +4200,13 @@ mod tests {
         // Verify the borrower now has storage
         let borrower_storage = engine
             .get_stores()
-            .get_storage_slot_for_fid(borrower_fid, EngineVersion::latest(), true, &vec![])
+            .get_storage_slot_for_fid(
+                borrower_fid,
+                EngineVersion::latest(),
+                true,
+                &vec![],
+                &FarcasterTime::current(),
+            )
             .unwrap();
         assert_eq!(
             borrower_storage.units_for(crate::proto::StorageUnitType::UnitType2025),
@@ -4209,7 +4215,13 @@ mod tests {
         // Verify the lender's storage was reduced
         let lender_storage = engine
             .get_stores()
-            .get_storage_slot_for_fid(lender_fid, EngineVersion::latest(), true, &vec![])
+            .get_storage_slot_for_fid(
+                lender_fid,
+                EngineVersion::latest(),
+                true,
+                &vec![],
+                &FarcasterTime::current(),
+            )
             .unwrap();
         // Lender should have default storage minus 1 unit lent
         assert_eq!(
@@ -4234,7 +4246,13 @@ mod tests {
         // Verify the lender's storage was returned
         let borrower_storage = engine
             .get_stores()
-            .get_storage_slot_for_fid(borrower_fid, EngineVersion::latest(), true, &vec![])
+            .get_storage_slot_for_fid(
+                borrower_fid,
+                EngineVersion::latest(),
+                true,
+                &vec![],
+                &FarcasterTime::current(),
+            )
             .unwrap();
         assert_eq!(
             borrower_storage.units_for(crate::proto::StorageUnitType::UnitType2025),
@@ -4242,7 +4260,13 @@ mod tests {
         );
         let lender_storage = engine
             .get_stores()
-            .get_storage_slot_for_fid(lender_fid, EngineVersion::latest(), true, &vec![])
+            .get_storage_slot_for_fid(
+                lender_fid,
+                EngineVersion::latest(),
+                true,
+                &vec![],
+                &FarcasterTime::current(),
+            )
             .unwrap();
         assert_eq!(
             lender_storage.units_for(crate::proto::StorageUnitType::UnitType2025),
@@ -4804,6 +4828,8 @@ mod tests {
                         VERIFICATION_FID,
                         proto::MessageType::VerificationAddEthAddress,
                         &mut RocksDbTransactionBatch::new(),
+                        EngineVersion::latest(),
+                        &FarcasterTime::current(),
                     )
                     .unwrap(),
                 (5, 5)
@@ -6824,5 +6850,204 @@ mod tests {
 
         assert!(!engine.validate_shard_chunk(&mismatched));
         assert!(engine.validate_shard_chunk(&chunk));
+    }
+
+    mod storage_expiry_replay_tests {
+        // Back-date the rent so the unit is already expired by the local clock, then stamp
+        // blocks just before and after expiry.
+        use super::*;
+        use crate::storage::store::account::StorageSlot;
+
+        const FID: u64 = 1234;
+        const ONE_YEAR_IN_SECONDS: u32 = 365 * 24 * 60 * 60;
+
+        // Shared across engines in a test because event factories randomize transaction hashes.
+        struct History {
+            rent: OnChainEvent,
+            id_register: OnChainEvent,
+            signer_event: OnChainEvent,
+            signer: ed25519_dalek::SigningKey,
+            before_expiry: FarcasterTime,
+            after_expiry: FarcasterTime,
+        }
+
+        fn history() -> History {
+            let signer = test_helper::default_signer();
+            // 4-year legacy validity (with V18 extension) expired an hour ago.
+            let rent = events_factory::create_rent_event_with_timestamp(
+                FID,
+                10,
+                time::current_timestamp() - 4 * ONE_YEAR_IN_SECONDS - 60 * 60,
+            );
+            let expiry =
+                StorageSlot::from_event(&rent, FarcasterNetwork::Devnet, EngineVersion::latest())
+                    .unwrap()
+                    .invalidate_at as u64;
+            History {
+                id_register: events_factory::create_id_register_event(
+                    FID,
+                    proto::IdRegisterEventType::Register,
+                    default_custody_address(),
+                    None,
+                ),
+                signer_event: events_factory::create_signer_event(
+                    FID,
+                    signer.clone(),
+                    proto::SignerEventType::Add,
+                    None,
+                    None,
+                ),
+                rent,
+                signer,
+                before_expiry: FarcasterTime::from_unix_seconds(expiry - 600),
+                after_expiry: FarcasterTime::from_unix_seconds(expiry + 600),
+            }
+        }
+
+        async fn engine_with(history: &History) -> (ShardEngine, tempfile::TempDir) {
+            let (mut engine, dir) = test_helper::new_engine_with_options(EngineOptions {
+                limits: Some(limits::test_store_limits()),
+                ..EngineOptions::default()
+            })
+            .await;
+            for event in [&history.rent, &history.id_register, &history.signer_event] {
+                commit_event_at(&mut engine, event, &history.before_expiry).await;
+            }
+            (engine, dir)
+        }
+
+        fn cast(history: &History, text: &str, at: &FarcasterTime) -> proto::Message {
+            messages_factory::casts::create_cast_add(
+                FID,
+                text,
+                Some(at.to_u64() as u32),
+                Some(&history.signer),
+            )
+        }
+
+        fn propose(
+            engine: &mut ShardEngine,
+            message: &proto::Message,
+            at: &FarcasterTime,
+        ) -> ShardStateChange {
+            engine.propose_state_change(
+                engine.shard_id(),
+                vec![MempoolMessage::UserMessage(message.clone())],
+                Some(at.clone()),
+            )
+        }
+
+        fn proposed_user_messages(state_change: &ShardStateChange) -> usize {
+            state_change
+                .transactions
+                .iter()
+                .map(|transaction| transaction.user_messages.len())
+                .sum()
+        }
+
+        #[tokio::test]
+        async fn test_proposer_judges_storage_at_block_timestamp() {
+            let history = history();
+            let (mut engine, _dir) = engine_with(&history).await;
+
+            let late = cast(&history, "after expiry", &history.after_expiry);
+            let state_change = propose(&mut engine, &late, &history.after_expiry);
+            assert_eq!(
+                proposed_user_messages(&state_change),
+                0,
+                "proposer kept a message for a block stamped after the unit expired"
+            );
+
+            let early = cast(&history, "before expiry", &history.before_expiry);
+            let state_change = propose(&mut engine, &early, &history.before_expiry);
+            assert_eq!(
+                proposed_user_messages(&state_change),
+                1,
+                "proposer dropped a message for a block stamped before the unit expired"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_commit_replays_chunk_stamped_before_expiry() {
+            let history = history();
+            let (mut engine, _dir) = engine_with(&history).await;
+
+            let first = cast(&history, "first", &history.before_expiry);
+            commit_message_at(&mut engine, &first, &history.before_expiry).await;
+
+            let second = cast(&history, "second", &history.before_expiry);
+            let state_change = propose(&mut engine, &second, &history.before_expiry);
+            assert_eq!(proposed_user_messages(&state_change), 1);
+
+            // start_round clears `pending_txn`, forcing `commit_shard_chunk` to replay.
+            let height = engine.get_confirmed_height();
+            engine.start_round(height.increment(), Round::Nil);
+            let chunk = test_helper::state_change_to_shard_chunk(
+                engine.shard_id(),
+                height.block_number + 1,
+                &state_change,
+            );
+            engine.commit_shard_chunk(&chunk).await;
+
+            assert_eq!(state_change.new_state_root, engine.trie_root_hash());
+            assert!(message_exists_in_trie(&mut engine, &first));
+            assert!(message_exists_in_trie(&mut engine, &second));
+        }
+
+        #[tokio::test]
+        async fn test_second_node_validates_and_commits_to_same_root() {
+            let history = history();
+            let (mut proposer, _proposer_dir) = engine_with(&history).await;
+            let (mut validator, _validator_dir) = engine_with(&history).await;
+            assert_eq!(proposer.trie_root_hash(), validator.trie_root_hash());
+
+            let message = cast(&history, "decided before expiry", &history.before_expiry);
+            let state_change = propose(&mut proposer, &message, &history.before_expiry);
+            assert_eq!(proposed_user_messages(&state_change), 1);
+
+            let height = validator.get_confirmed_height();
+            validator.start_round(height.increment(), Round::Nil);
+            assert!(
+                validator.validate_state_change(&state_change, height.increment()),
+                "second node rejected a block stamped before the unit expired"
+            );
+
+            validator.start_round(height.increment(), Round::Nil);
+            let chunk = test_helper::state_change_to_shard_chunk(
+                validator.shard_id(),
+                height.block_number + 1,
+                &state_change,
+            );
+            validator.commit_shard_chunk(&chunk).await;
+
+            assert_eq!(state_change.new_state_root, validator.trie_root_hash());
+            assert!(message_exists_in_trie(&mut validator, &message));
+        }
+
+        #[tokio::test]
+        async fn test_usage_limit_is_judged_at_given_timestamp() {
+            let history = history();
+            let (mut engine, _dir) = engine_with(&history).await;
+            let message = cast(&history, "counted", &history.before_expiry);
+            commit_message_at(&mut engine, &message, &history.before_expiry).await;
+
+            let stores = engine.get_stores();
+            let usage_at = |timestamp: &FarcasterTime| {
+                stores
+                    .get_usage(
+                        FID,
+                        proto::MessageType::CastAdd,
+                        &mut RocksDbTransactionBatch::new(),
+                        EngineVersion::latest(),
+                        timestamp,
+                    )
+                    .unwrap()
+            };
+
+            let (count, max_messages) = usage_at(&history.before_expiry);
+            assert_eq!(count, 1);
+            assert!(max_messages > 0);
+            assert_eq!(usage_at(&history.after_expiry), (1, 0));
+        }
     }
 }

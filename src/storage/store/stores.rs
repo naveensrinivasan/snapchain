@@ -403,6 +403,7 @@ impl Stores {
         engine_version: EngineVersion,
         count_borrowed_storage: bool,
         pending_events: &[OnChainEvent],
+        timestamp: &FarcasterTime,
     ) -> Result<StorageSlot, StoresError> {
         let lent_storage = StorageLendStore::get_lent_storage(&self.storage_lend_store, fid)
             .map_err(|err| StoresError::StoreError {
@@ -428,6 +429,7 @@ impl Stores {
                 pending_events,
                 &lent_storage,
                 &borrowed_storage,
+                timestamp,
             )
             .map_err(|e| StoresError::OnchainEventError(e))?;
 
@@ -439,17 +441,18 @@ impl Stores {
         fid: u64,
         message_type: MessageType,
         txn_batch: &mut RocksDbTransactionBatch,
+        engine_version: EngineVersion,
+        timestamp: &FarcasterTime,
     ) -> Result<(u32, u32), StoresError> {
         let store_type = Limits::message_type_to_store_type(message_type);
         let message_count = self.get_usage_by_store_type(fid, store_type, txn_batch)?;
         let count_borrowed_storage = store_type != StoreType::StorageLends;
-        // RPC/limit-enforcement path: max_messages is independent of invalidate_at, so the
-        // expiry-extension version gate does not affect the result here. Use the current version.
         let slot = self.get_storage_slot_for_fid(
             fid,
-            EngineVersion::current(self.network),
+            engine_version,
             count_borrowed_storage,
             &[],
+            timestamp,
         )?;
         let max_messages = self.store_limits.max_messages(&slot, store_type);
 
@@ -496,6 +499,7 @@ impl Stores {
     pub fn get_storage_limits(&self, fid: u64) -> Result<StorageLimitsResponse, StoresError> {
         let txn_batch = &mut RocksDbTransactionBatch::new();
         let mut limits = vec![];
+        let now = FarcasterTime::current();
         let purchased_slot = self
             .onchain_event_store
             .get_storage_slot_for_fid(
@@ -505,6 +509,7 @@ impl Stores {
                 &[],
                 &StorageSlot::new(0, 0, 0, u32::MAX),
                 &StorageSlot::new(0, 0, 0, u32::MAX),
+                &now,
             )
             .map_err(|e| StoresError::OnchainEventError(e))?;
         let borrowed_slot = StorageLendStore::get_borrowed_storage(&self.storage_lend_store, fid)
@@ -528,6 +533,7 @@ impl Stores {
                 &[],
                 &lent_slot,
                 &borrowed_slot,
+                &now,
             )
             .map_err(|e| StoresError::OnchainEventError(e))?;
         for store_type in vec![

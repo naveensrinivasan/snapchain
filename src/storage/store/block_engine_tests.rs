@@ -2790,6 +2790,7 @@ mod tests {
                 &vec![],
                 true,
                 true,
+                &FarcasterTime::current(),
             )
             .unwrap();
         assert_eq!(storage_slot.units_for(StorageUnitType::UnitType2025), 1);

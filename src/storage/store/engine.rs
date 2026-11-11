@@ -342,11 +342,17 @@ impl ShardEngine {
 
                 let storage_slot = self
                     .stores
-                    .get_storage_slot_for_fid(transaction.fid, version, true, maybe_onchainevents)
+                    .get_storage_slot_for_fid(
+                        transaction.fid,
+                        version,
+                        true,
+                        maybe_onchainevents,
+                        timestamp,
+                    )
                     .ok()?;
 
                 // Drop events if storage slot is inactive
-                if !storage_slot.is_active() {
+                if !storage_slot.is_active_at(timestamp) {
                     transaction.user_messages = vec![];
                 }
 
@@ -1654,7 +1660,7 @@ impl ShardEngine {
 
         for msg_type in message_types_to_prune {
             let fid = snapchain_txn.fid;
-            let result = self.prune_messages(fid, msg_type, txn_batch, &version);
+            let result = self.prune_messages(fid, msg_type, txn_batch, &version, timestamp);
             match result {
                 Ok(pruned_events) => {
                     for event in pruned_events {
@@ -1974,10 +1980,11 @@ impl ShardEngine {
         msg_type: MessageType,
         txn_batch: &mut RocksDbTransactionBatch,
         version: &EngineVersion,
+        timestamp: &FarcasterTime,
     ) -> Result<Vec<HubEvent>, EngineError> {
         let (current_count, max_count) = self
             .stores
-            .get_usage(fid, msg_type, txn_batch)
+            .get_usage(fid, msg_type, txn_batch, *version, timestamp)
             .map_err(|_| EngineError::UsageCountError)?;
 
         let events = match msg_type {
@@ -3306,6 +3313,7 @@ mod prune_arm_tests {
     //!
     //! Placed inline (rather than in engine_tests.rs) because `prune_messages` is a private
     //! method on `ShardEngine` and testing it directly avoids inventing a public hook.
+    use crate::core::util::FarcasterTime;
     use crate::proto::MessageType;
     use crate::storage::db::RocksDbTransactionBatch;
     use crate::storage::store::test_helper;
@@ -3322,6 +3330,7 @@ mod prune_arm_tests {
             MessageType::KeyAdd,
             &mut txn_batch,
             &version,
+            &FarcasterTime::current(),
         );
 
         let events = result.expect("KeyAdd prune arm must return Ok");
@@ -3343,6 +3352,7 @@ mod prune_arm_tests {
             MessageType::KeyRemove,
             &mut txn_batch,
             &version,
+            &FarcasterTime::current(),
         );
 
         let events = result.expect("KeyRemove prune arm must return Ok");

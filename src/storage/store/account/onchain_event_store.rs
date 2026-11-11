@@ -1023,19 +1023,20 @@ impl StorageSlot {
         Err(OnchainEventStorageError::InvalidStorageRentEventType)
     }
 
-    pub fn is_active(&self) -> bool {
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u32;
-        current_time < self.invalidate_at
+    pub fn is_active_at(&self, timestamp: &FarcasterTime) -> bool {
+        timestamp.to_unix_seconds() < self.invalidate_at as u64
     }
 
-    pub fn merge(&mut self, other: &StorageSlot) -> bool {
-        if !other.is_active() {
+    /// Uses the local clock; consensus paths must pass the block timestamp to [`Self::is_active_at`].
+    pub fn is_active(&self) -> bool {
+        self.is_active_at(&FarcasterTime::current())
+    }
+
+    pub fn merge_at(&mut self, other: &StorageSlot, timestamp: &FarcasterTime) -> bool {
+        if !other.is_active_at(timestamp) {
             return false;
         }
-        if !self.is_active() {
+        if !self.is_active_at(timestamp) {
             *self = other.clone();
             return true;
         }
@@ -1046,12 +1047,20 @@ impl StorageSlot {
         true
     }
 
-    pub fn sub(&mut self, other: &StorageSlot) {
-        if other.is_active() {
+    pub fn merge(&mut self, other: &StorageSlot) -> bool {
+        self.merge_at(other, &FarcasterTime::current())
+    }
+
+    pub fn sub_at(&mut self, other: &StorageSlot, timestamp: &FarcasterTime) {
+        if other.is_active_at(timestamp) {
             self.units_legacy -= other.units_legacy;
             self.units_2024 -= other.units_2024;
             self.units_2025 -= other.units_2025;
         }
+    }
+
+    pub fn sub(&mut self, other: &StorageSlot) {
+        self.sub_at(other, &FarcasterTime::current())
     }
 }
 
@@ -1338,26 +1347,29 @@ impl OnchainEventStore {
         pending_events: &[OnChainEvent],
         lent_storage: &StorageSlot,
         borrowed_storage: &StorageSlot,
+        timestamp: &FarcasterTime,
     ) -> Result<StorageSlot, OnchainEventStorageError> {
         let rent_events =
             self.get_onchain_events(OnChainEventType::EventTypeStorageRent, Some(fid))?;
         let mut storage_slot = StorageSlot::new(0, 0, 0, 0);
         for rent_event in rent_events {
-            storage_slot.merge(&StorageSlot::from_event(
-                &rent_event,
-                network,
-                engine_version,
-            )?);
+            storage_slot.merge_at(
+                &StorageSlot::from_event(&rent_event, network, engine_version)?,
+                timestamp,
+            );
         }
         // Now, virtually merge any pending rent events from the current transaction
         for event in pending_events {
             if event.fid == fid && event.r#type() == OnChainEventType::EventTypeStorageRent {
-                storage_slot.merge(&StorageSlot::from_event(event, network, engine_version)?);
+                storage_slot.merge_at(
+                    &StorageSlot::from_event(event, network, engine_version)?,
+                    timestamp,
+                );
             }
         }
 
-        storage_slot.sub(lent_storage);
-        storage_slot.merge(borrowed_storage);
+        storage_slot.sub_at(lent_storage, timestamp);
+        storage_slot.merge_at(borrowed_storage, timestamp);
 
         Ok(storage_slot)
     }
